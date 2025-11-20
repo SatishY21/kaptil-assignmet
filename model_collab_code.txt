@@ -1,0 +1,202 @@
+# Install required packages
+!pip install langchain langchain-community ctransformers chromadb sentence-transformers rouge-score nltk --quiet
+!pip install wget --quiet
+
+# NLTK download for BLEU
+import nltk
+nltk.download('punkt')
+
+import json, os, time
+from collections import defaultdict
+import numpy as np
+import wget
+
+# LangChain imports
+from langchain_community.document_loaders import TextLoader, DirectoryLoader
+from langchain.text_splitter import RecursiveCharacterTextSplitter
+from langchain_community.embeddings import HuggingFaceEmbeddings
+from langchain_community.vectorstores import Chroma
+from langchain_community.llms import CTransformers
+from langchain.chains import RetrievalQA
+
+from nltk.translate.bleu_score import sentence_bleu, SmoothingFunction
+from rouge_score import rouge_scorer
+from sklearn.metrics.pairwise import cosine_similarity
+
+# ----------------------------
+MODEL_PATH = "mistral-7b-instruct-v0.1.Q4_K_M.gguf"
+MODEL_URL = "https://huggingface.co/TheBloke/Mistral-7B-Instruct-v0.1-GGUF/resolve/main/mistral-7b-instruct-v0.1.Q4_K_M.gguf"
+
+LLM_KWARGS = {
+    "model": MODEL_PATH,
+    "model_type": "mistral",
+    "config": {'max_new_tokens': 512, 'temperature': 0.1, 'context_length': 2048, 'gpu_layers': 50}
+}
+
+EMBEDDING_MODEL_NAME = "sentence-transformers/all-MiniLM-L6-v2"
+CORPUS_DIR = "corpus"
+DATASET_PATH = "test_dataset.json"
+RESULTS_PATH = "test_results.json"
+
+CHUNK_STRATEGIES = {"small": (250, 50), "medium": (550, 50), "large": (900, 100)}
+
+# ----------------------------
+def download_llm_model(model_path, url):
+    if not os.path.exists(model_path):
+        print(f"Downloading model: {model_path}...")
+        wget.download(url, model_path)
+        print("\nDownload complete.")
+
+def load_documents(corpus_dir, chunk_size, chunk_overlap):
+    loader = DirectoryLoader(corpus_dir, glob="*.txt", loader_cls=TextLoader)
+    documents = loader.load()
+    text_splitter = RecursiveCharacterTextSplitter(
+        chunk_size=chunk_size,
+        chunk_overlap=chunk_overlap,
+        separators=["\n\n", "\n", ".", " ", ""]
+    )
+    return text_splitter.split_documents(documents)
+
+def initialize_rag(chunks, embeddings_model):
+    print("Building Vector Store (ChromaDB, in-memory)...")
+    # Use in-memory store to avoid write errors in Colab
+    vector_store = Chroma.from_documents(documents=chunks, embedding=embeddings_model)
+
+    llm = CTransformers(**LLM_KWARGS)
+
+    qa_chain = RetrievalQA.from_chain_type(
+        llm=llm,
+        chain_type="stuff",
+        retriever=vector_store.as_retriever(search_kwargs={"k": 5}),
+        return_source_documents=True
+    )
+    return qa_chain, None # Modified: Removed vector_store.get_ids()
+
+def calculate_retrieval_metrics(retrieved_docs, ground_truth_sources, chunk_ids):
+    hit = 0
+    rank = 0
+    k = 5
+    gt_file_names = set(ground_truth_sources)
+    retrieved_sources = [os.path.basename(doc.metadata.get('source', '')) for doc in retrieved_docs[:k]]
+    is_hit = len(gt_file_names.intersection(retrieved_sources)) > 0
+    if is_hit:
+        hit = 1
+        for i, source in enumerate(retrieved_sources):
+            if source in gt_file_names:
+                rank = 1.0 / (i + 1)
+                break
+    precision_at_k = 1 if is_hit else 0
+    return hit, rank, precision_at_k, retrieved_sources
+
+def calculate_answer_quality_metrics(generated_answer, ground_truth, embeddings_model):
+    scorer = rouge_scorer.RougeScorer(['rougeL'], use_stemmer=True)
+    rouge_scores = scorer.score(ground_truth, generated_answer)
+    rouge_l = rouge_scores['rougeL'].fmeasure
+
+    reference = [ground_truth.lower().split()]
+    candidate = generated_answer.lower().split()
+    bleu_score = sentence_bleu(reference, candidate, smoothing_function=SmoothingFunction().method4)
+
+    embeddings = embeddings_model.embed_documents([generated_answer, ground_truth])
+    similarity = cosine_similarity([embeddings[0]], [embeddings[1]])[0][0]
+
+    return rouge_l, bleu_score, similarity
+
+def run_evaluation(chunk_strategy_name, chunk_config, test_data):
+    chunk_size, chunk_overlap = chunk_config
+    print(f"\n--- Running Evaluation: {chunk_strategy_name} ---")
+
+    documents = load_documents(CORPUS_DIR, chunk_size, chunk_overlap)
+    embeddings_model = HuggingFaceEmbeddings(model_name=EMBEDDING_MODEL_NAME)
+    qa_chain, _ = initialize_rag(documents, embeddings_model)
+
+    results = []
+    total_questions = len(test_data["test_questions"])
+
+    for i, test_case in enumerate(test_data["test_questions"]):
+        start_time = time.time()
+        response = qa_chain.invoke(test_case["question"])
+
+        generated_answer = response['result']
+        retrieved_docs = response['source_documents']
+
+        gt_sources = test_case.get("source_documents", [])
+
+        hit, mrr, p_at_k, retrieved_file_names = calculate_retrieval_metrics(
+            retrieved_docs, gt_sources, []
+        )
+
+        rouge_l, bleu_score, semantic_sim = calculate_answer_quality_metrics(
+            generated_answer, test_case["ground_truth"], embeddings_model
+        )
+
+        end_time = time.time()
+
+        results.append({
+            "id": test_case["id"],
+            "question": test_case["question"],
+            "chunk_strategy": chunk_strategy_name,
+            "answerable": test_case["answerable"],
+            "ground_truth": test_case["ground_truth"],
+            "generated_answer": generated_answer,
+            "retrieved_sources": retrieved_file_names,
+            "metrics": {
+                "hit_rate": hit,
+                "mrr": mrr,
+                "precision_at_k": p_at_k,
+                "rouge_l": rouge_l,
+                "bleu_score": bleu_score,
+                "cosine_similarity": semantic_sim,
+                "latency_s": round(end_time - start_time, 2),
+            }
+        })
+
+        print(f"[{i+1}/{total_questions}] Q: {test_case['question'][:50]}... | Hit: {hit} | CosSim: {semantic_sim:.2f} | ROUGE-L: {rouge_l:.2f}")
+
+    return results
+
+def calculate_aggregate_scores(all_results):
+    aggregate_scores = defaultdict(lambda: defaultdict(list))
+    for result in all_results:
+        strategy = result["chunk_strategy"]
+        for metric, value in result["metrics"].items():
+            aggregate_scores[strategy][metric].append(value)
+
+    final_scores = {}
+    for strategy, metrics in aggregate_scores.items():
+        final_scores[strategy] = {metric: round(np.mean(values), 4) for metric, values in metrics.items()}
+    return final_scores
+
+# ----------------------------
+if __name__ == "__main__":
+    download_llm_model(MODEL_PATH, MODEL_URL)
+
+    if not os.path.exists(DATASET_PATH):
+        print(f"ERROR: Dataset not found at {DATASET_PATH}. Please upload your JSON dataset.")
+        exit()
+
+    with open(DATASET_PATH, 'r') as f:
+        test_data = json.load(f)
+
+    all_evaluation_results = []
+
+    for name, config in CHUNK_STRATEGIES.items():
+        strategy_results = run_evaluation(name, config, test_data)
+        all_evaluation_results.extend(strategy_results)
+
+    final_aggregate_scores = calculate_aggregate_scores(all_evaluation_results)
+
+    output_data = {
+        "timestamp": time.strftime("%Y-%m-%d %H:%M:%S"),
+        "aggregate_scores": final_aggregate_scores,
+        "detailed_results": all_evaluation_results
+    }
+
+    with open(RESULTS_PATH, 'w') as f:
+        json.dump(output_data, f, indent=4)
+
+    print("\n=======================================================")
+    print(f"Evaluation Complete! Results saved to {RESULTS_PATH}")
+    print("Aggregate Scores:")
+    print(json.dumps(final_aggregate_scores, indent=4))
+    print("=======================================================")
